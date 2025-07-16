@@ -52,12 +52,22 @@ def load_task_description(task_name: str) -> str:
 
 
 def embed_texts(texts, model_name: str, max_length: int = 8192) -> torch.Tensor:
-    tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left")
-    model = AutoModel.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name, padding_side="left", trust_remote_code=True
+    )
+    model = AutoModel.from_pretrained(model_name, trust_remote_code=True)
+    model.eval()
 
-    batch = tokenizer(texts, padding=True, truncation=True, max_length=max_length, return_tensors="pt")
+    batch = tokenizer(
+        texts,
+        padding=True,
+        truncation=True,
+        max_length=max_length,
+        return_tensors="pt",
+    )
     batch.to(model.device)
-    outputs = model(**batch)
+    with torch.no_grad():
+        outputs = model(**batch)
     embeddings = last_token_pool(outputs.last_hidden_state, batch["attention_mask"])
     return F.normalize(embeddings, p=2, dim=1)
 
