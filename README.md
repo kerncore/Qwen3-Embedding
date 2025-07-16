@@ -9,9 +9,12 @@ the `Qwen3-Embedding` model.
    `queries.txt` containing matching queries.
 2. Place the code snippet you want to compare in a file and run:
 
-   ```bash
-   python test_code_embedding.py --document path/to/code.py
-   ```
+    ```bash
+    python test_code_embedding.py --document path/to/code.py
+    ```
+
+    The script casts the model to `float32` automatically when running on
+    CPU to avoid NaN values in the computed embeddings.
 
 The script will read the task descriptions from `task_prompts.json`,
 compose prompts from the tasks and queries and print the cosine

@@ -67,6 +67,7 @@ def embed_texts(texts, model_name: str, max_length: int = 8192) -> torch.Tensor:
         model_name, padding_side="left", trust_remote_code=True
     )
     model = AutoModel.from_pretrained(model_name, trust_remote_code=True)
+    model.to(torch.float32)
     model.eval()
 
     batch = tokenizer(
@@ -79,7 +80,7 @@ def embed_texts(texts, model_name: str, max_length: int = 8192) -> torch.Tensor:
     batch.to(model.device)
     with torch.no_grad():
         outputs = model(**batch)
-    embeddings = last_token_pool(outputs.last_hidden_state, batch["attention_mask"])
+    embeddings = last_token_pool(outputs.last_hidden_state.float(), batch["attention_mask"])
     return F.normalize(embeddings, p=2, dim=1)
 
 
