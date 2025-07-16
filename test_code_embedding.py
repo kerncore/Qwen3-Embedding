@@ -1,8 +1,9 @@
 """Example script to test source code embeddings using Qwen3-Embedding model.
 
 This script composes a query instruction from a task description and a
-question about a source code file. It then embeds the query and a code
-snippet document and prints their cosine similarity.
+question about a source code file. It splits the file into logical code
+chunks using LangChain's ``LanguageParser`` and then embeds the query with
+the most relevant chunk to print their cosine similarity.
 
 The script reads a list of task names from ``tasks.txt`` and a list of
 queries from ``queries.txt``. Each line of the two files forms a pair. For
@@ -17,6 +18,9 @@ Example::
 import argparse
 import json
 from pathlib import Path
+
+from langchain_community.document_loaders.generic import GenericLoader
+from langchain_community.document_loaders.parsers import LanguageParser
 
 import torch
 import torch.nn.functional as F
@@ -51,6 +55,13 @@ def load_task_description(task_name: str) -> str:
     return desc
 
 
+def load_code_chunks(path: Path, language: str = "python") -> list[str]:
+    """Split a source file into code chunks using LanguageParser."""
+    loader = GenericLoader.from_filesystem(str(path), parser=LanguageParser(language=language))
+    docs = list(loader.lazy_load())
+    return [doc.page_content for doc in docs]
+
+
 def embed_texts(texts, model_name: str, max_length: int = 8192) -> torch.Tensor:
     tokenizer = AutoTokenizer.from_pretrained(
         model_name, padding_side="left", trust_remote_code=True
@@ -70,6 +81,30 @@ def embed_texts(texts, model_name: str, max_length: int = 8192) -> torch.Tensor:
         outputs = model(**batch)
     embeddings = last_token_pool(outputs.last_hidden_state, batch["attention_mask"])
     return F.normalize(embeddings, p=2, dim=1)
+
+
+def extract_snippet(
+    task_description: str,
+    query: str,
+    code_chunks: list[str],
+    model_name: str,
+    max_length: int,
+    top_k: int = 5,
+) -> str:
+    """Select code chunks most relevant to the task and query using embeddings."""
+    prompt = get_prompt(task_description, query)
+
+    if not code_chunks:
+        return ""
+
+    embeddings = embed_texts([prompt] + code_chunks, model_name, max_length=max_length)
+    prompt_emb = embeddings[0]
+    chunk_embs = embeddings[1:]
+    scores = torch.mv(chunk_embs, prompt_emb)
+    k = min(top_k, len(code_chunks))
+    top_idx = torch.topk(scores, k=k).indices.tolist()
+    snippet_chunks = [code_chunks[i] for i in sorted(top_idx)]
+    return "\n".join(snippet_chunks)
 
 
 def main() -> None:
@@ -103,14 +138,27 @@ def main() -> None:
     if len(tasks) != len(queries):
         raise ValueError("tasks_file and queries_file must have the same number of lines")
 
-    document_text = args.document.read_text(encoding="utf-8")
+    code_chunks = load_code_chunks(args.document)
+
+    snippet_embs = []
 
     for task_name, query in zip(tasks, queries):
         task_desc = load_task_description(task_name)
         prompt = get_prompt(task_desc, query)
-        embeddings = embed_texts([prompt, document_text], args.model, max_length=args.max_length)
+        snippet = extract_snippet(
+            task_desc, query, code_chunks, args.model, args.max_length
+        )
+        embeddings = embed_texts([prompt, snippet], args.model, max_length=args.max_length)
         score = float(embeddings[0] @ embeddings[1:].T)
+        snippet_embs.append(embeddings[1])
         print(f"{task_name!s}: {score:.4f}")
+
+    if len(snippet_embs) > 1:
+        ref = snippet_embs[0]
+        for idx, emb in enumerate(snippet_embs[1:], 1):
+            cos_delta = float(ref @ emb)
+            dist_delta = float(torch.dist(ref, emb))
+            print(f"Δ task0-task{idx} | Cosine: {cos_delta:.4f} | Dist: {dist_delta:.4f}")
 
 
 if __name__ == "__main__":
