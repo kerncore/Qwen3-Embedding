@@ -19,3 +19,10 @@ the `Qwen3-Embedding` model.
 The script will read the task descriptions from `task_prompts.json`,
 compose prompts from the tasks and queries and print the cosine
 similarity between each prompt and the code snippet.
+
+## JavaScript reranker example
+
+The repository also includes `qwen3_reranker_onnx.js` which demonstrates how to
+use [transformers.js](https://huggingface.co/docs/transformers.js/index) with the
+ONNX version of **Qwen3-Reranker**. The class exposes an `infer()` method that
+mirrors the Python example and returns probabilities for "yes" and "no" answers.
