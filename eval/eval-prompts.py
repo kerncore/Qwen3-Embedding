@@ -13,9 +13,14 @@ Data format  (JSONL) — one pair per line:
 }
 """
 
-import json, argparse, sys, os
+import json
+import argparse
+import sys
+import os
 from pathlib import Path
 from collections import defaultdict
+
+import pandas as pd
 
 import numpy as np
 from sentence_transformers import SentenceTransformer
@@ -84,68 +89,114 @@ def encode_texts(model, texts, instruction):
     )
 
 
+def compare_instruction_similarity(model, instructions: dict, title: str) -> None:
+    names = list(instructions.keys())
+    vecs = encode_texts(model, instructions.values(), instruction="")
+    sims = cosine_similarity(vecs)
+    df = pd.DataFrame(sims, index=names, columns=names)
+    print(f"\n=== {title} ===")
+    print(df.round(3).to_string())
+
+
 def evaluate(model: SentenceTransformer, data, top_k=5):
-    """
-    Возвращает: dict[variant][key] → метрики.
-    """
-    # группируем пару query–doc по key
+    """Return DataFrame with metrics for every formatting variant and key."""
+
     grouped = defaultdict(list)
     for row in data:
         grouped[row["key"]].append(row)
 
-    results = defaultdict(dict)
+    rows_out = []
 
     for var_name, fmt in FORMATTING_VARIANTS.items():
-        for key, rows in grouped.items():
+        for key, pairs in grouped.items():
             idx_instr = fmt(INDEXING_INSTR[key])
             qry_instr = fmt(SEARCH_INSTR[key])
 
-            # индексация документов
             doc_vecs = encode_texts(
-                model, [r["doc"] for r in rows], instruction=idx_instr
+                model,
+                [r["doc"] for r in pairs],
+                instruction=idx_instr,
             )
             doc_vecs = np.vstack(doc_vecs).astype("float32")
-            doc_ids  = [r["id"] for r in rows]
+            doc_ids = [r["id"] for r in pairs]
 
-            # запросы
             query_vecs = encode_texts(
-                model, [r["query"] for r in rows], instruction=qry_instr
+                model,
+                [r["query"] for r in pairs],
+                instruction=qry_instr,
             )
 
-            # метрики
-            cos_all, hits_all, mrr_all = [], [], []
-            for q_vec, row in zip(query_vecs, rows):
+            cos_all, hits_all, mrr_all, margin_all = [], [], [], []
+            for q_vec, pair in zip(query_vecs, pairs):
                 sims = cosine_similarity(q_vec[None], doc_vecs)[0]
-                ranked = np.argsort(-sims)             # по убыванию
-                cos_all.append(float(sims[doc_ids.index(row["id"])]))
-
-                # Recall@k
-                hits_all.append(row["id"] in np.array(doc_ids)[ranked[:top_k]])
-                # MRR@k
-                rank = np.where(np.array(doc_ids)[ranked] == row["id"])[0][0] + 1
+                ranked = np.argsort(-sims)
+                correct_idx = doc_ids.index(pair["id"])
+                cos_val = float(sims[correct_idx])
+                cos_all.append(cos_val)
+                hits_all.append(pair["id"] in np.array(doc_ids)[ranked[:top_k]])
+                rank = np.where(np.array(doc_ids)[ranked] == pair["id"])[0][0] + 1
                 mrr_all.append(1 / rank)
 
-            results[var_name][key] = {
-                "mean_cosine":  np.mean(cos_all),
-                f"recall@{top_k}": np.mean(hits_all),
-                f"mrr@{top_k}":    np.mean(mrr_all),
-                "n": len(rows),
+                # margin between relevant and best non-relevant
+                other = np.delete(sims, correct_idx)
+                margin_all.append(float(cos_val - np.max(other)))
+
+            mean_cos = np.mean(cos_all)
+            results_row = {
+                "variant": var_name,
+                "key": key,
+                "instruction": f"{var_name}/{key}",
+                "index_instr": idx_instr,
+                "search_instr": qry_instr,
+                "precision@{k}".format(k=top_k): np.mean(hits_all),
+                "recall@{k}".format(k=top_k): np.mean(hits_all),
+                "MRR": np.mean(mrr_all),
+                "avg_greet": mean_cos,
+                "min_greet": float(np.min(cos_all)),
+                "margin": float(np.mean(margin_all)),
+                "stability": float(1.0 / (1.0 + np.std(cos_all))),
             }
+            rows_out.append(results_row)
 
-    return results
+    return pd.DataFrame(rows_out)
 
 
-def print_report(res, top_k):
-    header = f"{'variant':<11} | {'key':<22} | cosine  | recall |  mrr  | n"
-    print("\n" + header + "\n" + "-" * len(header))
-    for var, per_key in res.items():
-        for key, metr in sorted(per_key.items(), key=lambda x: -x[1]["mean_cosine"]):
-            print(
-                f"{var:<11} | {key:<22} | "
-                f"{metr['mean_cosine']:.4f} | "
-                f"{metr[f'recall@{top_k}']:.2%} | "
-                f"{metr[f'mrr@{top_k}']:.3f} | {metr['n']}"
-            )
+def print_report(df: pd.DataFrame, top_k: int) -> None:
+    df_base = df.copy()
+
+    print("\n=== TOP BY PRECISION@K ===")
+    prec_col = f"precision@{top_k}"
+    recall_col = f"recall@{top_k}"
+    top_prec = df_base.nlargest(5, prec_col)[["instruction", prec_col, recall_col, "MRR"]]
+    print(top_prec.to_string(index=False))
+
+    print("\n=== TOP 10 BY MARGIN ===")
+    top_margin = df_base.nlargest(10, "margin")[["instruction", "margin", "avg_greet", "min_greet", "stability"]]
+    print(top_margin.to_string(index=False))
+
+    print("\n=== TOP 10 BY AVERAGE (for stability) ===")
+    top_avg = df_base.nlargest(10, "avg_greet")[["instruction", "avg_greet", "margin", "stability"]]
+    print(top_avg.to_string(index=False))
+
+    print("\n=== TOP 5 BY STABILITY (consistent across all code types) ===")
+    good_margin = df_base[df_base["margin"] > 0.15]
+    top_stable = good_margin.nlargest(5, "stability")[["instruction", "stability", "margin", "min_greet"]]
+    print(top_stable.to_string(index=False))
+
+    required_cols = ["margin", "avg_greet", "stability", "MRR"]
+    for col in required_cols:
+        if col not in df_base.columns:
+            df_base[col] = 0.0
+
+    df_base["composite_score"] = (
+        0.35 * df_base["margin"] +
+        0.30 * df_base["avg_greet"] +
+        0.35 * df_base["stability"]
+    )
+
+    print("\n=== TOP 5 BY COMPOSITE SCORE ===")
+    top_comp = df_base.nlargest(5, "composite_score")[["instruction", "composite_score", "margin", "avg_greet", "stability"]]
+    print(top_comp.to_string(index=False))
 
 
 def main():
@@ -160,9 +211,14 @@ def main():
     model = SentenceTransformer(args.model_id, device=args.device)
 
     data = load_dataset(Path(args.data))
-    res  = evaluate(model, data, top_k=args.top_k)
+    df_res = evaluate(model, data, top_k=args.top_k)
 
-    print_report(res, args.top_k)
+    print_report(df_res, args.top_k)
+
+    compare_instruction_similarity(model, INDEXING_INSTR, "Index_Instruct vs Index_Instruct")
+    for name, fmt in FORMATTING_VARIANTS.items():
+        formatted = {k: fmt(v) for k, v in SEARCH_INSTR.items()}
+        compare_instruction_similarity(model, formatted, f"Search_Instruct ({name}) vs Search_Instruct")
 
 
 if __name__ == "__main__":
